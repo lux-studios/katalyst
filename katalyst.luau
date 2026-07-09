@@ -23,9 +23,6 @@
 
 local katalyst = {}
 
-local userInputService = game:GetService("UserInputService")
-local isStudio = game:GetService("RunService"):IsStudio()
-
 local updateQueue = {}
 local scheduleThread: thread?
 
@@ -89,10 +86,10 @@ export type StateObject<T> = {
 }
 export type State<T> = StateObject<T>
 
-local stateCleanupRegistry = setmetatable({}, { __mode = "k" })
+local stateCleanupRegistry = setmetatable({}, {__mode = "k"})
 
 local function isState(obj: any): boolean
-	return type(obj) == "table" and obj.get and obj.set and obj.onChange ~= nil
+	return stateCleanupRegistry[obj] == true
 end
 
 local function impl_state<T>(initial: T): State<T>
@@ -112,17 +109,18 @@ local function impl_state<T>(initial: T): State<T>
 			return
 		end
 
-		if typeof(oldValue) == "table" and typeof(val) == "table" then
+		if type(oldValue) == "table" and type(val) == "table" then
 			local function deepEquals(a, b)
 				if a == b then return true end
 				if typeof(a) ~= typeof(b) then return false end
-				if typeof(a) ~= "table" then return false end
+				if type(a) ~= "table" then return false end
 
 				for k, v in next, a do
 					if not deepEquals(v, b[k]) then
 						return false
 					end
 				end
+
 				for k in next, b do
 					if a[k] == nil then
 						return false
@@ -163,44 +161,34 @@ end
 
 katalyst.State = impl_state
 
-export type ReactiveValue =
-| string
-| number
-| boolean
-| Color3
-| UDim2
-| Vector2
-| Rect
-| BrickColor
-| EnumItem
-| { [any]: any }
+export type ReactiveValue = string | number | boolean | Color3 | UDim2 | Vector2 | Rect | BrickColor | EnumItem | {[any]: any}
 export type ReactiveProp<R = ReactiveValue> = R | State<R> | (() -> R)
 
 export type Proxy<I> = (() -> I) & I
 
 export type PropertyTable<I = Instance> = {
 	[string]: ReactiveProp<any>?,
-	Children: { Instance | { Instance } }?,
+	Children: {Instance | {Instance} }?,
 	Ref: ((self: Proxy<I>) -> (() -> ())?)?,
 }
 
 export type NewConstructor = ((className: string) -> (props: PropertyTable) -> Proxy<Instance>)
 
 local proxyRegistry = setmetatable({}, {__mode = "k"})
-local childCache = setmetatable({}, { __mode = "k" })
-local childCleanupConnections = setmetatable({}, { __mode = "k" })
+local childCache = setmetatable({}, {__mode = "k"})
+local childCleanupConnections = setmetatable({}, {__mode = "k"})
 
-local function updateChildren(parent: Instance, newChildren: { any })
+local function updateChildren(parent: Instance, newChildren: {any})
 	local cache = childCache[parent] or {}
 	local used = {}
 
-	for i, child in ipairs(newChildren) do
-		local inst = nil
-		if typeof(child) == "table" and #child > 0 then
+	for i, child in next, newChildren do
+		local inst
+		if type(child) == "table" and #child > 0 then
 			updateChildren(parent, child)
 		elseif typeof(child) == "Instance" then
 			inst = child
-		elseif typeof(child) == "table" then
+		elseif type(child) == "table" then
 			local ok, result = pcall(child)
 			if ok and typeof(result) == "Instance" then
 				inst = result
@@ -211,16 +199,11 @@ local function updateChildren(parent: Instance, newChildren: { any })
 			if inst.Parent ~= parent then
 				inst.Parent = parent
 			end
-
-			if inst:IsA("GuiObject") then
-				inst.LayoutOrder = i
-			end
-
 			used[inst] = true
 		end
 	end
 
-	for inst in pairs(cache) do
+	for inst in next, cache do
 		if not used[inst] then
 			inst.Parent = nil
 		end
@@ -240,78 +223,76 @@ end
 local function impl_new(className: string)
 	return function(props: PropertyTable<any>)
 		local instance = Instance.new(className)
-		local stateConnections: { [string]: any } = {}
-
-		-- proxy wrapper
-		local proxy = {}
-		local mt = {}
-		setmetatable(proxy, mt)
+		local stateConnections: {[string]: any} = {}
 
 		-- children reactivity
 		local function applyChildren(val: any)
-			if typeof(val) == "function" then
+			if type(val) == "function" then
 				updateChildren(instance, val() or {})
 			elseif isState(val) then
-				local function apply(newVal)
+				updateChildren(instance, val:get() or {})
+				val:onChange(function(newVal)
 					updateChildren(instance, newVal or {})
-				end
-
-				apply(val:get())
-				val:onChange(apply)
+				end)
 			elseif val then
 				updateChildren(instance, val)
 			end
 		end
 
-		mt.__index = function(_, k)
-			local member = instance[k]
-			if type(member) == "function" then
-				return function(self, ...)
-					if self == proxy then
-						self = instance
+		-- proxy wrapper
+		local proxy = {}
+		setmetatable(proxy, table.freeze {
+			__index = function(_, k)
+				local member = instance[k]
+				if type(member) == "function" then
+					return function(self, ...)
+						if self == proxy then
+							self = instance
+						end
+						return member(self, ...)
 					end
-					return member(self, ...)
 				end
-			end
-			return member
-		end
+				return member
+			end,
 
-		mt.__newindex = function(_, k, v)
-			if isState(v) then
-				instance[k] = v:get()
-				if stateConnections[k] then
-					stateConnections[k]:Disconnect()
+			__newindex = function(_, k, v)
+				if isState(v) then
+					instance[k] = v:get()
+					if stateConnections[k] then
+						stateConnections[k]:Disconnect()
+					end
+					stateConnections[k] = v:onChange(function(newVal)
+						instance[k] = newVal
+					end)
+				elseif type(v) == "function" and k ~= katalyst.Children then
+					local result = v()
+					instance[k] = result
+				elseif k == katalyst.Children then
+					applyChildren(v)
+				else
+					instance[k] = v
 				end
-				stateConnections[k] = v:onChange(function(newVal)
-					instance[k] = newVal
-				end)
-			elseif typeof(v) == "function" and k ~= katalyst.Children then
-				local result = v()
-				instance[k] = result
-			elseif k == katalyst.Children then
-				applyChildren(v)
-			else
+			end,
+
+			__tostring = function()
+				return instance:GetFullName()
+			end,
+
+			__eq = function(_, other)
+				return other == instance or other == proxy
+			end,
+
+			__call = function()
+				return instance
+			end,
+
+			__metatable = "This metatable is locked"
+		})
+
+		for k, v in next, props do
+			if k ~= katalyst.Ref then
 				instance[k] = v
-			end
-		end
-
-		mt.__tostring = function()
-			return instance:GetFullName()
-		end
-
-		mt.__eq = function(_, other)
-			return other == instance or other == proxy
-		end
-
-		mt.__call = function()
-			return instance
-		end
-
-		mt.__metatable = "This metatable is locked"
-
-		-- apply props
-		for k, v in pairs(props) do
-			if k == katalyst.Ref and typeof(v) == "function" then
+			elseif type(v) == "function" then
 				task.defer(function()
 					local cleanup = v(proxy)
 					if cleanup then
@@ -320,18 +301,16 @@ local function impl_new(className: string)
 				end)
 			end
 		end
-
+		
 		proxyRegistry[proxy] = true
 
 		instance.Destroying:Once(function()
-			for _, conn in pairs(stateConnections) do
+			for _, conn in next, stateConnections do
 				conn:Disconnect()
 			end
-
 			table.clear(stateConnections)
 		end)
 
-		table.freeze(mt)
 		return (proxy :: any) :: Proxy<any>
 	end
 end
@@ -340,20 +319,14 @@ local function impl_errorBoundary(fallbackComponent)
 	return function(component)
 		return function(props)
 			local _, result = xpcall(component, function(err)
-				warn("lb/essentials/katalyst:", "component error:", err)
+				warn("katalyst:", "component error:", err)
 				local result = debug.traceback(err, 2)
 
 				if fallbackComponent then
 					return fallbackComponent(props, result)
 				end
 
-				return katalyst.New "TextLabel" ({
-					Text = isStudio and ("Error: " .. tostring(result))
-						or "Component Error",
-					TextColor3 = Color3.new(1, 0, 0),
-					BackgroundColor3 = Color3.new(1, 1, 1),
-					Size = UDim2.new(1, 0, 0, 50),
-				})
+				return nil
 			end, props)
 
 			return result
@@ -361,15 +334,14 @@ local function impl_errorBoundary(fallbackComponent)
 	end
 end
 
-function katalyst.Fragment(render: () -> { Instance }): { Instance }
+function katalyst.Fragment(render: () -> {Instance}): {Instance}
 	return render()
 end
 
-function katalyst.Map<T>(array: { T }, render: (item: T, index: number) -> Instance)
+function katalyst.Map<T>(array: {T}, render: (item: T, index: number) -> Instance)
 	local results = {}
-	for i, item in ipairs(array) do
+	for i, item in next, array do
 		local child = render(item, i)
-		child.LayoutOrder = i
 		results[i] = child
 	end
 	return results
