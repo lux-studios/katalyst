@@ -1,5 +1,5 @@
 -- General-purpose instance framework
--- https://github.com/lux-studios/katalyst-lb
+-- https://github.com/lux-studios/katalyst
 
 -- Copyright (c) 2026 Lux Studios
 
@@ -28,14 +28,14 @@ local scheduleThread: thread?
 
 local function flushUpdates()
 	scheduleThread = nil
-
+	
 	local toUpdate = updateQueue
 	updateQueue = {}
-
+	
 	local function catch(err)
 		warn(debug.traceback(string.format("Error in batched update: %s", tostring(err)), 2))
 	end
-
+	
 	for fn in next, toUpdate do
 		xpcall(fn, catch)
 	end
@@ -50,26 +50,26 @@ end
 
 local function createSignal()
 	local listeners: {() -> ()} = {}
-
+	
 	local function connect(_, fn)
 		table.insert(listeners, fn)
-
+		
 		local function disconnect()
 			local index = table.find(listeners, fn)
 			if index then
 				table.remove(listeners, index)
 			end
 		end
-
+		
 		return {Disconnect = disconnect, disconnect = disconnect}
 	end
-
+	
 	local function fire(_, ...)
 		for _, fn in next, listeners do
 			fn(...)
 		end
 	end
-
+	
 	return {
 		Connect = connect, connect = connect,
 		Fire = fire, fire = fire,
@@ -97,54 +97,54 @@ local function impl_state<T>(initial: T): State<T>
 		_value = initial,
 		_changed = createSignal()
 	}
-
+	
 	function stateObj:get(): T
 		return self._value
 	end
-
+	
 	function stateObj:set(val: T)
 		local oldValue = self._value
-
+		
 		if oldValue == val then
 			return
 		end
-
+		
 		if type(oldValue) == "table" and type(val) == "table" then
 			local function deepEquals(a, b)
 				if a == b then return true end
 				if typeof(a) ~= typeof(b) then return false end
 				if type(a) ~= "table" then return false end
-
+				
 				for k, v in next, a do
 					if not deepEquals(v, b[k]) then
 						return false
 					end
 				end
-
+				
 				for k in next, b do
 					if a[k] == nil then
 						return false
 					end
 				end
-
+				
 				return true
 			end
-
+			
 			if deepEquals(oldValue, val) then
 				return
 			end
 		end
-
+		
 		self._value = val
 		scheduleUpdate(function()
 			self._changed:Fire(val)
 		end)
 	end
-
+	
 	function stateObj:onChange(fn)
 		return self._changed:Connect(fn)
 	end
-
+	
 	function stateObj:destroy()
 		if self._changed then
 			-- Disconnect all listeners and reset signal
@@ -152,10 +152,10 @@ local function impl_state<T>(initial: T): State<T>
 		end
 		stateCleanupRegistry[self] = nil
 	end
-
+	
 	-- Register for cleanup tracking
 	stateCleanupRegistry[stateObj] = true
-
+	
 	return (stateObj :: any) :: State<T>
 end
 
@@ -181,36 +181,37 @@ local childCleanupConnections = setmetatable({}, {__mode = "k"})
 local function updateChildren(parent: Instance, newChildren: {any})
 	local cache = childCache[parent] or {}
 	local used = {}
-
-	for i, child in next, newChildren do
-		local inst
-		if type(child) == "table" and #child > 0 then
-			updateChildren(parent, child)
-		elseif typeof(child) == "Instance" then
-			inst = child
-		elseif type(child) == "table" then
-			local ok, result = pcall(child)
-			if ok and typeof(result) == "Instance" then
-				inst = result
+	
+	local function recurse(newChildren: {any})
+		for i, child in next, newChildren do
+			local inst
+			if proxyRegistry[child] then
+				inst = child()
+			elseif type(child) == "table" and #child > 0 then
+				recurse(child)
+			elseif typeof(child) == "Instance" then
+				inst = child
 			end
-		end
-
-		if inst then
-			if inst.Parent ~= parent then
-				inst.Parent = parent
+			
+			if inst then
+				if inst.Parent ~= parent then
+					inst.Parent = parent
+				end
+				used[inst] = true
 			end
-			used[inst] = true
 		end
 	end
-
+	
+	recurse(newChildren)
+	
 	for inst in next, cache do
 		if not used[inst] then
 			inst.Parent = nil
 		end
 	end
-
+	
 	childCache[parent] = used
-
+	
 	-- Setup cleanup for parent destruction
 	if not childCleanupConnections[parent] then
 		childCleanupConnections[parent] = parent.Destroying:Connect(function()
@@ -224,7 +225,7 @@ local function impl_new(className: string)
 	return function(props: PropertyTable<any>)
 		local instance = Instance.new(className)
 		local stateConnections: {[string]: any} = {}
-
+		
 		-- children reactivity
 		local function applyChildren(val: any)
 			if type(val) == "function" then
@@ -238,7 +239,7 @@ local function impl_new(className: string)
 				updateChildren(instance, val)
 			end
 		end
-
+		
 		-- proxy wrapper
 		local proxy = {}
 		setmetatable(proxy, table.freeze {
@@ -254,7 +255,7 @@ local function impl_new(className: string)
 				end
 				return member
 			end,
-
+			
 			__newindex = function(_, k, v)
 				if isState(v) then
 					instance[k] = v:get()
@@ -273,44 +274,49 @@ local function impl_new(className: string)
 					instance[k] = v
 				end
 			end,
-
+			
 			__tostring = function()
 				return instance:GetFullName()
 			end,
-
+			
 			__eq = function(_, other)
-				return other == instance or other == proxy
+				return rawequal(other, instance) or rawequal(other, proxy)
 			end,
-
+			
 			__call = function()
 				return instance
 			end,
-
+			
 			__metatable = "This metatable is locked"
 		})
-
+		
+		proxyRegistry[proxy] = true
+		
 		for k, v in next, props do
-			if k ~= katalyst.Ref then
-				instance[k] = v
-			elseif type(v) == "function" then
-				task.defer(function()
-					local cleanup = v(proxy)
-					if cleanup then
-						instance.Destroying:Connect(cleanup)
-					end
-				end)
+			if k == katalyst.Ref then
+				continue
+			else
+				proxy[k] = v
 			end
 		end
 		
-		proxyRegistry[proxy] = true
-
+		local ref = props[katalyst.Ref]
+		if type(ref) == "function" then
+			task.defer(function()
+				local cleanup = ref(proxy)
+				if cleanup then
+					instance.Destroying:Connect(cleanup)
+				end
+			end)
+		end
+		
 		instance.Destroying:Once(function()
 			for _, conn in next, stateConnections do
 				conn:Disconnect()
 			end
 			table.clear(stateConnections)
 		end)
-
+		
 		return (proxy :: any) :: Proxy<any>
 	end
 end
@@ -321,14 +327,14 @@ local function impl_errorBoundary(fallbackComponent)
 			local _, result = xpcall(component, function(err)
 				warn("katalyst:", "component error:", err)
 				local result = debug.traceback(err, 2)
-
+				
 				if fallbackComponent then
 					return fallbackComponent(props, result)
 				end
-
+				
 				return nil
 			end, props)
-
+			
 			return result
 		end
 	end
@@ -348,12 +354,12 @@ function katalyst.Map<T>(array: {T}, render: (item: T, index: number) -> Instanc
 end
 
 function katalyst.Unwrap<T>(value: Proxy<T> | State<T>): any
-		if isState(value) then
-				return value:get()
-		elseif proxyRegistry[value] then
-				return value()
-		end
-		return value
+	if isState(value) then
+		return value:get()
+	elseif proxyRegistry[value] then
+		return value()
+	end
+	return value
 end
 
 katalyst.New = (impl_new :: any) :: NewConstructor
